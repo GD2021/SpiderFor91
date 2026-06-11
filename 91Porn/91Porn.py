@@ -100,6 +100,17 @@ def write_jsonl(event: dict):
     print(json.dumps(event, ensure_ascii=False), flush=True)
 
 
+def positive_int(*values, default: int) -> int:
+    for value in values:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return default
+
+
 class Porn91Spider:
     def __init__(
         self,
@@ -645,12 +656,17 @@ def run_job(job_path: str):
     if job.get("mode") not in ("", None, "crawl"):
         raise ValueError(f"unsupported crawler mode: {job.get('mode')!r}")
 
-    try:
-        target_new = int(job.get("target_new") or 15)
-    except (TypeError, ValueError):
-        target_new = 15
-    if target_new <= 0:
-        target_new = 15
+    candidate_budget = positive_int(
+        job.get("candidate_budget"),
+        job.get("target_new"),
+        default=15,
+    )
+    unique_target = positive_int(job.get("unique_target"), default=0)
+    print(
+        f"[job] unique_target={unique_target or 'unknown'} candidate_budget={candidate_budget}",
+        file=sys.stderr,
+        flush=True,
+    )
     seen_file = job.get("seen_source_ids_file") or ""
     output_dir = job.get("output_dir") or os.getcwd()
     run_id = job.get("run_id") or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -687,7 +703,7 @@ def run_job(job_path: str):
         max_pages=None,
         resume=False,
         quiet=True,
-        target_new=target_new,
+        target_new=candidate_budget,
         seen_viewkeys=seen_viewkeys,
         stream_output=True,
         stream_protocol="crawler.v1",
@@ -809,7 +825,7 @@ def main():
     except Exception as e:
         spider.log(f"发生未预料的错误: {e}")
         import traceback
-        traceback.print_exc()
+        traceback.print_exc(file=sys.stderr)
         spider._save_results()
         raise
 
