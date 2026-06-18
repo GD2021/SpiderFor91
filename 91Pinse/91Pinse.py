@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-脚本名称: 91Porn
-用途: 爬取 91Porn 列表中的视频标题、视频下载直链、封面图直链和唯一标识，
-并按 crawler.v1 协议输出给 video-site-91 后端入库。
+脚本名称: 91Pinse 爬虫（基于原 91Porn 脚本改造）
+用途: 从 91pinse.com 列表页爬取视频标题、视频下载直链、封面图直链和唯一标识，
+并按 crawler.v1 协议输出给后端入库。
 
-已修改: 默认不再固定为热门(category=top)，默认不带 category 查询参数以抓取全部视频。
-新增: CLI 参数 --category 可用于指定单个分类（例如 "top"、"new" 等）。
+说明:
+ - 该脚本多数逻辑继承自 91Porn/91Porn.py，但增加了 --site 参数以支持自定义镜像站点（例如 https://91pinse.com）
+ - 不同镜像站的 HTML 可能存在差异，若解析失败请根据目标站点调整 CSS 选择器或正则。
 """
 
 import argparse
@@ -18,7 +19,7 @@ import os
 import socket
 import sys
 import html
-from urllib.parse import urljoin, unquote, urlparse
+from urllib.parse import urlencode, urljoin, unquote, urlparse
 from datetime import datetime
 
 try:
@@ -49,10 +50,11 @@ def prefer_ipv4_for_plain_socks5_proxy():
     socket.getaddrinfo = getaddrinfo_ipv4_first
     socket._spider91_ipv4_first = True
 
-BASE_URL = "https://www.91porn.com/v.php"
-# LIST_PARAMS 不再固定为热门，保留配置位置以供扩展
+
+DEFAULT_SITE = "https://91pinse.com"
+BASE_PATH = "/v.php"
+# 列表页参数位置保留以扩展
 LIST_PARAMS = {
-    # "category": "top",
     "viewtype": "basic"
 }
 
@@ -70,10 +72,6 @@ HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
 }
 
 MIN_PAGE_DELAY = 3.0
@@ -84,11 +82,11 @@ MAX_DETAIL_DELAY = 5.0
 MAX_RETRIES = 3
 RETRY_DELAY = 5.0
 
-OUTPUT_FILE = "91porn_videos.json"
+OUTPUT_FILE = "91pinse_videos.json"
 MAX_PAGES = None
 RESUME = True
 MAX_EMPTY_PAGES = 2
-CRAWLER_NAME = "91Porn"
+CRAWLER_NAME = "91Pinse"
 CRAWLER_PROTOCOL = "crawler.v1"
 
 
@@ -115,9 +113,10 @@ def positive_int(*values, default: int) -> int:
     return default
 
 
-class Porn91Spider:
+class PinseSpider:
     def __init__(
         self,
+        site: str = None,
         output_file: str = None,
         start_page: int = 1,
         max_pages: int = None,
@@ -128,8 +127,9 @@ class Porn91Spider:
         seen_viewkeys: list = None,
         stream_output: bool = False,
         stream_protocol: str = "legacy",
-        category: str = None,
     ):
+        self.site = (site or DEFAULT_SITE).rstrip('/')
+        self.base_url = self.site + BASE_PATH
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.session.cookies.set("mode", "d")
@@ -145,8 +145,6 @@ class Porn91Spider:
         self.quiet = bool(quiet)
         self.stream_output = bool(stream_output)
         self.stream_protocol = stream_protocol or "legacy"
-        # 新增: 支持按分类抓取，None 或空字符串表示不带 category（抓取全部）
-        self.category = category.strip() if isinstance(category, str) and category.strip() else None
 
         try:
             from requests.adapters import HTTPAdapter
@@ -207,28 +205,38 @@ class Porn91Spider:
         try:
             if self.stream_protocol == "crawler.v1":
                 source_id = crawler_source_id(video.get("source_id") or video.get("viewkey") or "")
-                item = {
-                    "title": video.get("title") or "",
-                    "detail_url": video.get("detail_url") or "",
-                    "author": "91porn",
-                    "tags": ["91porn"],
-                    "media_url": video.get("video_url") or "",
-                    "thumbnail_url": video.get("thumb_url") or "",
-                    "headers": {
-                        "Referer": video.get("detail_url") or BASE_URL,
-                    },
-                }
-                if source_id:
-                    item["source_id"] = source_id
+                media_url = video.get("video_url") or ""
+                if not source_id or not media_url:
+                    print(
+                        f"[stream] skip invalid item: source_id={source_id!r} media_url={bool(media_url)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return
                 event = {
                     "type": "item",
-                    "item": item,
+                    "source_id": source_id,
+                    "title": video.get("title") or "",
+                    "media_url": media_url,
+                    "thumbnail_url": video.get("thumb_url") or "",
+                    "detail_url": video.get("detail_url") or "",
+                    "author": "91pinse",
+                    "tags": ["91pinse"],
+                    "headers": {
+                        "Referer": video.get("detail_url") or self.base_url,
+                    },
                 }
                 write_jsonl(event)
             else:
                 print(json.dumps(video, ensure_ascii=False), flush=True)
         except Exception as e:
             print(f"[stream] emit failed: {e}", file=sys.stderr, flush=True)
+
+    def build_list_url(self, page_num: int) -> str:
+        params = dict(LIST_PARAMS)
+        if page_num > 1:
+            params["page"] = str(page_num)
+        return f"{self.base_url}?{urlencode(params)}"
 
     def random_sleep(self, min_sec: float, max_sec: float):
         delay = random.uniform(min_sec, max_sec)
@@ -291,12 +299,19 @@ class Porn91Spider:
         videos = []
         soup = BeautifulSoup(html, 'lxml')
 
+        # 大多数 91 系列镜像使用与 91porn 相似的卡片结构，保留原解析逻辑
         video_cards = soup.select('div.col-xs-12.col-sm-4.col-md-3.col-lg-3')
+
+        if not video_cards:
+            # 有些镜像使用稍有不同的类名
+            video_cards = soup.select('div.video') or soup.select('li.playList')
 
         seen_cards = set()
 
         for card in video_cards:
             link = card.find('a', href=re.compile(r'view_video\.php\?viewkey='))
+            if not link:
+                link = card.find('a', href=re.compile(r'view_video\.php'))
             if not link:
                 continue
             href = link.get('href', '')
@@ -304,11 +319,9 @@ class Porn91Spider:
                 continue
 
             match = re.search(r'viewkey=([^&]+)', href)
-            if not match:
-                continue
-            viewkey = match.group(1)
+            viewkey = match.group(1) if match else ''
 
-            detail_url = urljoin(BASE_URL, href)
+            detail_url = urljoin(self.base_url, href)
 
             title = self._extract_title(link)
 
@@ -321,7 +334,7 @@ class Porn91Spider:
             if img:
                 thumb_url = img.get('src', '') or img.get('data-original', '')
                 if thumb_url:
-                    thumb_url = urljoin(BASE_URL, thumb_url)
+                    thumb_url = urljoin(self.base_url, thumb_url)
             if not source_id and thumb_url:
                 source_id = self._extract_thumb_source_id(thumb_url)
 
@@ -366,6 +379,7 @@ class Porn91Spider:
         if title:
             result["title"] = title
 
+        # 许多镜像页面使用 strencode2 或内嵌的 mp4 链接，保留原有解析尝试
         strencode_match = re.search(r'strencode2\(["\']([^"\']+)["\']\)', html)
         if strencode_match:
             encoded = strencode_match.group(1)
@@ -383,7 +397,7 @@ class Porn91Spider:
                 self.log(f"  解码 strencode2 失败: {e}")
 
         mp4_match = re.search(
-            r'https?://[^\s"\'"<>]+\.mp4[^\s"\'"<>]*',
+            r"""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""",
             html
         )
         if mp4_match:
@@ -401,7 +415,7 @@ class Porn91Spider:
         if not title_el:
             return ""
         title = title_el.get_text(" ", strip=True)
-        title = re.sub(r'\s*-\s*91porn.*$', '', title, flags=re.IGNORECASE).strip()
+        title = re.sub(r'\s*-\s*91(?:porn|pinse).*$', '', title, flags=re.IGNORECASE).strip()
         return html.unescape(title)[:160]
 
     def _extract_source_id(self, video_url: str) -> str:
@@ -439,7 +453,7 @@ class Porn91Spider:
 
     def crawl(self):
         self.log("=" * 60)
-        self.log("91porn 视频爬虫启动")
+        self.log(f"{CRAWLER_NAME} 视频爬虫启动 (site={self.site})")
         self.log("=" * 60)
         self.log(f"配置: 列表页延时 {MIN_PAGE_DELAY}-{MAX_PAGE_DELAY}s, 详情页延时 {MIN_DETAIL_DELAY}-{MAX_DETAIL_DELAY}s")
         self.log(f"配置: 最大重试 {MAX_RETRIES} 次, 连续空页上限 {self.max_empty_pages}")
@@ -449,10 +463,6 @@ class Porn91Spider:
         self.log(f"配置: 输出文件 {os.path.abspath(self.output_file)}")
         if self.skip_viewkeys:
             self.log(f"配置: 已跳过 {len(self.skip_viewkeys)} 个已知 viewkey")
-        if self.category:
-            self.log(f"配置: 指定分类 category={self.category}")
-        else:
-            self.log("配置: 未指定 category，默认抓取全部视频")
         self.log("")
 
         page_num = self.start_page
@@ -470,16 +480,7 @@ class Porn91Spider:
                 self.log(f"已累计 {self.processed_videos} 个新视频，达到目标 {self.target_new}，停止")
                 break
 
-            # 构建基础列表页 URL：如果指定了 category 则带上，否则只使用 viewtype=basic（可返回全部）
-            if self.category:
-                base_url = f"{BASE_URL}?category={self.category}&viewtype=basic"
-            else:
-                base_url = f"{BASE_URL}?viewtype=basic"
-
-            if page_num == 1:
-                page_url = base_url
-            else:
-                page_url = f"{base_url}&page={page_num}"
+            page_url = self.build_list_url(page_num)
 
             if crawled_in_session > 0:
                 self.log("")
@@ -591,7 +592,8 @@ class Porn91Spider:
     def _save_results(self):
         output_data = {
             "crawl_time": datetime.now().isoformat(),
-            "source_url": BASE_URL,
+            "source_site": self.site,
+            "source_url": self.base_url,
             "pages_crawled": self.pages_crawled,
             "total_videos": len(self.results),
             "successful": self.processed_videos,
@@ -633,10 +635,10 @@ class Porn91Spider:
 def print_help():
     print("""
 ================================================
-    91porn 视频爬虫 v1.0
+    91pinse 视频爬虫
 ================================================
 
-本脚本将爬取 91porn 列表下的所有视频信息：
+本脚本将爬取 91pinse 列表下的所有视频信息：
   - 视频名称
   - 封面图直链
   - 视频直链 (MP4)
@@ -645,23 +647,9 @@ def print_help():
     pip install requests beautifulsoup4 lxml PySocks
 
 使用方法:
-    python spider_91porn.py
-    python spider_91porn.py --category top
+    python 91Pinse.py --site https://91pinse.com
 
-配置说明 (编辑脚本内 "配置区域"):
-    MIN_PAGE_DELAY / MAX_PAGE_DELAY : 列表页请求间隔 (默认 3-6 秒)
-    MIN_DETAIL_DELAY / MAX_DETAIL_DELAY : 详情页请求间隔 (默认 2-5 秒)
-    MAX_PAGES : 限制最大爬取页数 (None=不限, 如 5=只爬前5页)
-    OUTPUT_FILE : 输出文件名 (默认 91porn_videos.json)
-
-按 Ctrl+C 可随时中断并保存已爬取的数据
-
-注意:
-    1. 视频直链包含时效性token，会过期，需定期重新爬取
-    2. 脚本已内置随机延时，请勿移除，避免对服务器造成压力
-    3. 如遇到Cloudflare拦截，需要先通过浏览器获取Cookie
-    4. 本脚本仅供学习交流，请遵守当地法律法规
-================================================
+注意: 不同镜像站 HTML 可能不同，如解析失败请调整 parse_list_page / parse_detail_page
 """)
 
 
@@ -677,7 +665,7 @@ def run_job(job_path: str):
     candidate_budget = positive_int(
         job.get("candidate_budget"),
         job.get("target_new"),
-        default=15,
+        default=10,
     )
     unique_target = positive_int(job.get("unique_target"), default=0)
     print(
@@ -685,13 +673,15 @@ def run_job(job_path: str):
         file=sys.stderr,
         flush=True,
     )
-    seen_file = job.get("seen_source_ids_file") or ""
+
     config = job.get("config") if isinstance(job.get("config"), dict) else {}
-    category = str(config.get("category") or "").strip() or None
+    site = str(config.get("site") or DEFAULT_SITE).strip() or DEFAULT_SITE
+
+    seen_file = job.get("seen_source_ids_file") or ""
     output_dir = job.get("output_dir") or os.getcwd()
     run_id = job.get("run_id") or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, f"spider91-{run_id}.json")
+    output_file = os.path.join(output_dir, f"spider91pinse-{run_id}.json")
 
     network = job.get("network") if isinstance(job.get("network"), dict) else {}
     proxy_url = str(network.get("proxy_url") or "").strip()
@@ -717,7 +707,8 @@ def run_job(job_path: str):
             print(f"警告: 读取 seen_source_ids_file 失败: {e}", file=sys.stderr, flush=True)
 
     prefer_ipv4_for_plain_socks5_proxy()
-    spider = Porn91Spider(
+    spider = PinseSpider(
+        site=site,
         output_file=output_file,
         start_page=1,
         max_pages=None,
@@ -727,7 +718,6 @@ def run_job(job_path: str):
         seen_viewkeys=seen_viewkeys,
         stream_output=True,
         stream_protocol="crawler.v1",
-        category=category,
     )
     try:
         spider.crawl()
@@ -747,15 +737,12 @@ def run_job(job_path: str):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help', 'help'):
-        print_help()
-        return
-
     parser = argparse.ArgumentParser(
-        prog="spider_91porn.py",
-        description="91porn 视频元数据爬虫",
-        add_help=False,
+        prog="91Pinse.py",
+        description="91pinse 视频元数据爬虫",
     )
+    parser.add_argument("--site", type=str, default=DEFAULT_SITE,
+                        help="目标站点域名或完整 URL，例如 https://91pinse.com")
     parser.add_argument("--page", type=int, default=None,
                         help="只爬指定页（单页模式，配合 --output 用于定时任务）")
     parser.add_argument("--output", type=str, default=None,
@@ -767,32 +754,20 @@ def main():
     parser.add_argument("--quiet", action="store_true",
                         help="压缩日志，每条视频只输出关键事件")
     parser.add_argument("--target-new", type=int, default=None,
-                        help="目标新增模式：从 page 1 起翻页直到累计处理这么多新源视频后停止（backend 凌晨任务用）")
+                        help="目标新增模式：从 page 1 起翻页直到累计处理这么多新源视频后停止")
     parser.add_argument("--seen-viewkeys-file", type=str, default=None,
                         help="文件路径，每行一个已处理过的 viewkey 或 mp4 源 ID；脚本会跳过这些视频")
     parser.add_argument("--stream-output", action="store_true",
-                        help="流式模式：每解析一条视频直链就立即把它作为一行 JSON 写到 stdout 并 flush；"
-                             "日志改走 stderr。配合 backend 边读边下载使用。")
+                        help="流式模式：每解析一条视频直链就立即把它作为一行 JSON 写到 stdout 并 flush；日志改走 stderr。")
     parser.add_argument("--job", type=str, default=None,
                         help="crawler.v1 job JSON 路径；作为通用脚本爬虫运行。")
-    # 新增: 支持指定 category（默认为 None，表示不带 category，抓取全部）
-    parser.add_argument("--category", type=str, default=None,
-                        help="分类，默认空表示抓取全部视频；例如 --category top")
 
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args()
     if args.job:
         run_job(args.job)
         return
 
-    cli_out = sys.stderr if args.stream_output else sys.stdout
     prefer_ipv4_for_plain_socks5_proxy()
-
-    print("""
-================================================
-    91porn 视频爬虫启动中...
-================================================
-按 Ctrl+C 可随时中断并保存进度
-""", file=cli_out)
 
     seen_viewkeys = []
     if args.seen_viewkeys_file:
@@ -803,26 +778,15 @@ def main():
                     if line:
                         seen_viewkeys.append(line)
         except FileNotFoundError:
-            print(f"警告: --seen-viewkeys-file 不存在: {args.seen_viewkeys_file}", file=cli_out)
+            print(f"警告: --seen-viewkeys-file 不存在: {args.seen_viewkeys_file}")
         except Exception as e:
-            print(f"警告: 读取 --seen-viewkeys-file 失败: {e}", file=cli_out)
+            print(f"警告: 读取 --seen-viewkeys-file 失败: {e}")
 
-    if args.target_new is not None:
-        spider = Porn91Spider(
-            output_file=args.output,
-            start_page=1,
-            max_pages=None,
-            resume=False,
-            quiet=args.quiet,
-            target_new=args.target_new,
-            seen_viewkeys=seen_viewkeys,
-            stream_output=args.stream_output,
-            category=args.category,
-        )
-    elif args.page is not None:
+    if args.page is not None:
         start_page = max(1, args.page)
         max_pages = args.max_pages if args.max_pages and args.max_pages > 0 else 1
-        spider = Porn91Spider(
+        spider = PinseSpider(
+            site=args.site,
             output_file=args.output,
             start_page=start_page,
             max_pages=max_pages,
@@ -830,16 +794,15 @@ def main():
             quiet=args.quiet,
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
-            category=args.category,
         )
     else:
-        spider = Porn91Spider(
+        spider = PinseSpider(
+            site=args.site,
             output_file=args.output,
             resume=False if args.no_resume else None,
             quiet=args.quiet,
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
-            category=args.category,
         )
 
     try:
