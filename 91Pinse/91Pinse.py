@@ -5,11 +5,13 @@
 并按 crawler.v1 协议输出给后端入库。
 
 说明:
- - 该脚本多数逻辑继承自 91Porn/91Porn.py，但增加了 --site 参数以支持自定义镜像站点（例如 https://91pinse.com）
- - 不同镜像站的 HTML 可能存在差异，若解析失败请根据目标站点调整 CSS 选择器或正则。
+ - 默认从 https://91pinse.com/v/hot/ 热门列表抓取视频
+ - 列表页解析 article.video-card，详情页解析内嵌流地址并默认选取最高画质直链
+ - 旧版镜像站仍保留 91Porn 风格解析作为回退逻辑
 """
 
 import argparse
+import base64
 import requests
 import re
 import time
@@ -19,7 +21,7 @@ import os
 import socket
 import sys
 import html
-from urllib.parse import urlencode, urljoin, unquote, urlparse
+from urllib.parse import urljoin, unquote, urlparse
 from datetime import datetime
 
 try:
@@ -52,11 +54,7 @@ def prefer_ipv4_for_plain_socks5_proxy():
 
 
 DEFAULT_SITE = "https://91pinse.com"
-BASE_PATH = "/v.php"
-# 列表页参数位置保留以扩展
-LIST_PARAMS = {
-    "viewtype": "basic"
-}
+LIST_PATH = "/v/hot/"
 
 HEADERS = {
     "User-Agent": (
@@ -99,7 +97,10 @@ def crawler_source_id(raw: str) -> str:
 
 
 def write_jsonl(event: dict):
-    print(json.dumps(event, ensure_ascii=False), flush=True)
+    try:
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+    except BrokenPipeError:
+        sys.exit(0)
 
 
 def positive_int(*values, default: int) -> int:
@@ -124,12 +125,16 @@ class PinseSpider:
         max_empty_pages: int = None,
         quiet: bool = False,
         target_new: int = None,
+        candidate_budget: int = None,
         seen_viewkeys: list = None,
         stream_output: bool = False,
         stream_protocol: str = "legacy",
+        proxies: dict = None,
+        job_mode: bool = False,
     ):
         self.site = (site or DEFAULT_SITE).rstrip('/')
-        self.base_url = self.site + BASE_PATH
+        self.list_path = LIST_PATH if LIST_PATH.endswith('/') else LIST_PATH + '/'
+        self.base_url = self.site + self.list_path
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.session.cookies.set("mode", "d")
@@ -141,10 +146,20 @@ class PinseSpider:
         self.max_empty_pages = (
             MAX_EMPTY_PAGES if max_empty_pages is None else int(max_empty_pages)
         )
+        self.candidate_budget = (
+            candidate_budget
+            if candidate_budget and candidate_budget > 0
+            else None
+        )
         self.target_new = target_new if target_new and target_new > 0 else None
         self.quiet = bool(quiet)
         self.stream_output = bool(stream_output)
         self.stream_protocol = stream_protocol or "legacy"
+        self.job_mode = bool(job_mode)
+        self.emitted = 0
+        self.checked = 0
+        if proxies:
+            self.session.proxies.update(proxies)
 
         try:
             from requests.adapters import HTTPAdapter
@@ -174,6 +189,9 @@ class PinseSpider:
                 vk = vk.strip()
                 if vk:
                     self.skip_viewkeys.add(vk)
+                    safe_id = crawler_source_id(vk)
+                    if safe_id:
+                        self.skip_viewkeys.add(safe_id)
 
         if self.resume and os.path.exists(self.output_file):
             try:
@@ -183,8 +201,11 @@ class PinseSpider:
                 self.results = existing_videos
                 for v in existing_videos:
                     vk = v.get('viewkey', '')
+                    sid = v.get('source_id', '')
                     if vk:
                         self.skip_viewkeys.add(vk)
+                    if sid:
+                        self.skip_viewkeys.add(sid)
                 self.processed_videos = existing_data.get('successful', 0)
                 self.failed_videos = existing_data.get('failed', 0)
                 self.log(f"加载已有数据: {len(self.results)} 个视频, 将跳过已处理项")
@@ -194,25 +215,40 @@ class PinseSpider:
     def log(self, message: str):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] {message}"
-        if self.stream_output:
+        if self.stream_output or self.job_mode:
             print(line, file=sys.stderr, flush=True)
         else:
             print(line)
 
-    def emit_stream_video(self, video: dict):
+    def _output_budget(self) -> int:
+        if self.candidate_budget:
+            return self.candidate_budget
+        if self.target_new:
+            return self.target_new
+        return 0
+
+    def _reached_output_budget(self) -> bool:
+        budget = self._output_budget()
+        if not budget:
+            return False
+        if self.stream_output or self.job_mode:
+            return self.emitted >= budget
+        return self.processed_videos >= budget
+
+    def emit_stream_video(self, video: dict) -> bool:
         if not self.stream_output:
-            return
+            return False
         try:
             if self.stream_protocol == "crawler.v1":
                 source_id = crawler_source_id(video.get("source_id") or video.get("viewkey") or "")
                 media_url = video.get("video_url") or ""
                 if not source_id or not media_url:
-                    print(
-                        f"[stream] skip invalid item: source_id={source_id!r} media_url={bool(media_url)}",
-                        file=sys.stderr,
-                        flush=True,
+                    self.log(
+                        f"[stream] skip invalid item: source_id={source_id!r} "
+                        f"media_url={bool(media_url)}"
                     )
-                    return
+                    return False
+                referer = video.get("detail_url") or self.base_url
                 event = {
                     "type": "item",
                     "source_id": source_id,
@@ -220,23 +256,229 @@ class PinseSpider:
                     "media_url": media_url,
                     "thumbnail_url": video.get("thumb_url") or "",
                     "detail_url": video.get("detail_url") or "",
-                    "author": "91pinse",
-                    "tags": ["91pinse"],
                     "headers": {
-                        "Referer": video.get("detail_url") or self.base_url,
+                        "Referer": referer,
+                        "User-Agent": HEADERS["User-Agent"],
                     },
                 }
+                quality = video.get("quality")
+                if quality:
+                    event["quality"] = quality
                 write_jsonl(event)
-            else:
-                print(json.dumps(video, ensure_ascii=False), flush=True)
+                return True
+            write_jsonl(video)
+            return True
+        except BrokenPipeError:
+            sys.exit(0)
         except Exception as e:
-            print(f"[stream] emit failed: {e}", file=sys.stderr, flush=True)
+            self.log(f"[stream] emit failed: {e}")
+            return False
 
     def build_list_url(self, page_num: int) -> str:
-        params = dict(LIST_PARAMS)
         if page_num > 1:
-            params["page"] = str(page_num)
-        return f"{self.base_url}?{urlencode(params)}"
+            return f"{self.base_url}?page={page_num}"
+        return self.base_url
+
+    def _is_seen(self, video: dict) -> bool:
+        viewkey = str(video.get("viewkey") or "").strip()
+        source_id = str(video.get("source_id") or "").strip()
+        if viewkey and viewkey in self.skip_viewkeys:
+            return True
+        if source_id and source_id in self.skip_viewkeys:
+            return True
+        safe_id = crawler_source_id(source_id or viewkey)
+        return bool(safe_id and safe_id in self.skip_viewkeys)
+
+    def _extract_post_id(self, url: str) -> str:
+        match = re.search(r"/v/(\d+)", urlparse(url or "").path)
+        return match.group(1) if match else ""
+
+    def _extract_embedded_video_urls(self, html_text: str) -> list:
+        urls = []
+        seen = set()
+        for script_match in re.finditer(r"<script[^>]*>([\s\S]*?)</script>", html_text):
+            body = script_match.group(1)
+            if "loadSource" not in body or "atob" not in body:
+                continue
+            for encoded_match in re.finditer(r"'(aHR0c[^']+)'", body):
+                encoded = encoded_match.group(1).replace("\\u003D", "=")
+                try:
+                    url = base64.b64decode(encoded).decode("utf-8").strip()
+                except Exception:
+                    continue
+                if (
+                    url.startswith("http")
+                    and (".m3u8" in url or ".mp4" in url.lower())
+                    and url not in seen
+                ):
+                    seen.add(url)
+                    urls.append(url)
+        return urls
+
+    def _normalize_pinse_stream_url(self, url: str) -> str:
+        if "jfly.xyz" in url and ".m3u8" in url and "hot=" in url:
+            url = re.sub(r"hot=\d+", "hot=1", url)
+        return url
+
+    def _quality_hint_from_url(self, url: str) -> tuple:
+        low = url.lower()
+        for height in (2160, 1440, 1080, 720, 480, 360, 240):
+            if re.search(rf"(?:^|[^0-9]){height}(?:p|x|$)", low):
+                return height, f"{height}p"
+        if ".mp4" in low:
+            return 900, "mp4"
+        if "hot=1" in low:
+            return 800, "hls-hot"
+        if "pl.m3u8" in low:
+            return 700, "hls-playlist"
+        if ".m3u8" in low:
+            return 600, "hls"
+        return 0, ""
+
+    def _fetch_playlist_text(self, url: str, referer: str) -> str:
+        headers = {
+            "User-Agent": HEADERS["User-Agent"],
+            "Referer": referer,
+            "Accept": "*/*",
+        }
+        try:
+            response = self.session.get(url, headers=headers, timeout=20)
+            if response.status_code != 200:
+                return ""
+            text = response.text
+            if "#EXTM3U" not in text:
+                return ""
+            return text
+        except Exception:
+            return ""
+
+    def _parse_m3u8_master_variants(self, content: str, base_url: str) -> list:
+        variants = []
+        lines = content.splitlines()
+        idx = 0
+        while idx < len(lines):
+            line = lines[idx].strip()
+            if line.startswith("#EXT-X-STREAM-INF:"):
+                bandwidth = 0
+                height = 0
+                bw_match = re.search(r"BANDWIDTH=(\d+)", line)
+                if bw_match:
+                    bandwidth = int(bw_match.group(1))
+                res_match = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
+                if res_match:
+                    height = int(res_match.group(2))
+                idx += 1
+                while idx < len(lines) and (
+                    not lines[idx].strip() or lines[idx].strip().startswith("#")
+                ):
+                    idx += 1
+                if idx < len(lines):
+                    uri = lines[idx].strip()
+                    if uri and not uri.startswith("#"):
+                        variants.append({
+                            "url": urljoin(base_url, uri),
+                            "bandwidth": bandwidth,
+                            "height": height,
+                        })
+            idx += 1
+        return variants
+
+    def _resolve_highest_m3u8(self, url: str, referer: str, depth: int = 0) -> tuple:
+        if depth > 2:
+            hint, label = self._quality_hint_from_url(url)
+            return url, label
+
+        content = self._fetch_playlist_text(url, referer)
+        if not content:
+            _, label = self._quality_hint_from_url(url)
+            return url, label
+
+        if "#EXT-X-STREAM-INF:" in content:
+            variants = self._parse_m3u8_master_variants(content, url)
+            if not variants:
+                _, label = self._quality_hint_from_url(url)
+                return url, label
+            best = max(variants, key=lambda item: (item["height"], item["bandwidth"]))
+            quality = f"{best['height']}p" if best["height"] else ""
+            resolved_url, nested_quality = self._resolve_highest_m3u8(
+                best["url"],
+                referer,
+                depth + 1,
+            )
+            return resolved_url, nested_quality or quality
+
+        if ".ts" in content or ".m4s" in content:
+            return url, "hls"
+        if ".jpg" in content or ".webp" in content:
+            return url, "hls-hot"
+        _, label = self._quality_hint_from_url(url)
+        return url, label
+
+    def _select_highest_quality_url(self, candidates: list, referer: str) -> tuple:
+        ranked = []
+        for raw in candidates:
+            url = self._normalize_pinse_stream_url(str(raw or "").strip())
+            if not url.startswith("http"):
+                continue
+
+            hint, label = self._quality_hint_from_url(url)
+            low = url.lower()
+
+            if ".mp4" in low:
+                ranked.append((1_000_000 + hint, url, label or "mp4"))
+                continue
+
+            if ".m3u8" in low:
+                resolved, quality = self._resolve_highest_m3u8(url, referer)
+                res_score = 0
+                if quality and quality.endswith("p"):
+                    try:
+                        res_score = int(quality[:-1])
+                    except ValueError:
+                        res_score = 0
+                hot_bonus = 50_000 if "hot=1" in resolved else 0
+                playlist_bonus = 30_000 if "pl.m3u8" in resolved else 0
+                ranked.append((
+                    800_000 + res_score * 100 + hot_bonus + playlist_bonus + hint,
+                    resolved,
+                    quality or label or "hls",
+                ))
+
+        if not ranked:
+            return "", ""
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return ranked[0][1], ranked[0][2]
+
+    def _collect_video_url_candidates(self, html_text: str) -> list:
+        candidates = []
+        seen = set()
+
+        def add(url: str):
+            value = (url or "").strip()
+            if value.startswith("http") and value not in seen:
+                seen.add(value)
+                candidates.append(value)
+
+        for url in self._extract_embedded_video_urls(html_text):
+            add(url)
+
+        strencode_match = re.search(r'strencode2\(["\']([^"\']+)["\']\)', html_text)
+        if strencode_match:
+            try:
+                decoded = unquote(strencode_match.group(1))
+                src_match = re.search(r"src=['\"]([^'\"]+)['\"]", decoded)
+                if src_match:
+                    add(re.sub(r"(https?://[^/]+)//+", r"\1/", src_match.group(1)))
+            except Exception:
+                pass
+
+        for match in re.finditer(r"https?://[^\s\"'<>]+\.mp4[^\s\"'<>]*", html_text, re.I):
+            url = match.group(0)
+            if "kwai" not in url and "ad-" not in url.lower():
+                add(url)
+
+        return candidates
 
     def random_sleep(self, min_sec: float, max_sec: float):
         delay = random.uniform(min_sec, max_sec)
@@ -296,10 +538,55 @@ class PinseSpider:
         return ""
 
     def parse_list_page(self, html: str) -> list:
-        videos = []
         soup = BeautifulSoup(html, 'lxml')
+        videos = self._parse_pinse_list_page(soup)
+        if videos:
+            return videos
+        return self._parse_legacy_list_page(soup)
 
-        # 大多数 91 系列镜像使用与 91porn 相似的卡片结构，保留原解析逻辑
+    def _parse_pinse_list_page(self, soup: BeautifulSoup) -> list:
+        videos = []
+        seen_cards = set()
+
+        for card in soup.select("article.video-card"):
+            link = card.find("a", href=re.compile(r"/v/\d+"))
+            if not link:
+                continue
+
+            href = link.get("href", "").strip()
+            if not href:
+                continue
+
+            post_id = self._extract_post_id(href)
+            if not post_id:
+                continue
+
+            detail_url = urljoin(self.site + "/", href)
+            img = card.find("img")
+            thumb_url = ""
+            title = ""
+            if img:
+                thumb_url = (img.get("src") or img.get("data-src") or "").strip()
+                title = (img.get("alt") or "").strip()
+            if not title:
+                title = self._extract_title(link)
+
+            if post_id in seen_cards:
+                continue
+            seen_cards.add(post_id)
+
+            videos.append({
+                "title": title,
+                "detail_url": detail_url,
+                "thumb_url": thumb_url,
+                "viewkey": post_id,
+                "source_id": post_id,
+            })
+
+        return videos
+
+    def _parse_legacy_list_page(self, soup: BeautifulSoup) -> list:
+        videos = []
         video_cards = soup.select('div.col-xs-12.col-sm-4.col-md-3.col-lg-3')
 
         if not video_cards:
@@ -321,7 +608,7 @@ class PinseSpider:
             match = re.search(r'viewkey=([^&]+)', href)
             viewkey = match.group(1) if match else ''
 
-            detail_url = urljoin(self.base_url, href)
+            detail_url = urljoin(self.site + "/", href)
 
             title = self._extract_title(link)
 
@@ -334,7 +621,7 @@ class PinseSpider:
             if img:
                 thumb_url = img.get('src', '') or img.get('data-original', '')
                 if thumb_url:
-                    thumb_url = urljoin(self.base_url, thumb_url)
+                    thumb_url = urljoin(self.site + "/", thumb_url)
             if not source_id and thumb_url:
                 source_id = self._extract_thumb_source_id(thumb_url)
 
@@ -369,7 +656,7 @@ class PinseSpider:
         text = re.sub(r'\s+', ' ', text).strip()
         return html.unescape(text)[:120]
 
-    def parse_detail_page(self, html: str) -> dict:
+    def parse_detail_page(self, html: str, referer: str = "") -> dict:
         result = {}
 
         if not html:
@@ -379,33 +666,19 @@ class PinseSpider:
         if title:
             result["title"] = title
 
-        # 许多镜像页面使用 strencode2 或内嵌的 mp4 链接，保留原有解析尝试
-        strencode_match = re.search(r'strencode2\(["\']([^"\']+)["\']\)', html)
-        if strencode_match:
-            encoded = strencode_match.group(1)
-            try:
-                decoded = unquote(encoded)
-
-                src_match = re.search(r"src=['\"]([^'\"]+)['\"]", decoded)
-                if src_match:
-                    video_url = src_match.group(1)
-                    video_url = re.sub(r'(https?://[^/]+)//+', r'\1/', video_url)
-                    result["video_url"] = video_url
-                    result["source_id"] = self._extract_source_id(video_url)
-                    return result
-            except Exception as e:
-                self.log(f"  解码 strencode2 失败: {e}")
-
-        mp4_match = re.search(
-            r"""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""",
-            html
+        candidates = self._collect_video_url_candidates(html)
+        video_url, quality = self._select_highest_quality_url(
+            candidates,
+            referer or self.base_url,
         )
-        if mp4_match:
-            url = mp4_match.group(0)
-            if 'kwai' not in url and 'ad-' not in url.lower():
-                result["video_url"] = url
-                result["source_id"] = self._extract_source_id(url)
-                return result
+        if video_url:
+            result["video_url"] = video_url
+            if quality:
+                result["quality"] = quality
+            source_id = self._extract_source_id(video_url)
+            if source_id:
+                result["source_id"] = source_id
+            return result
 
         return result
 
@@ -432,6 +705,9 @@ class PinseSpider:
     def _extract_thumb_source_id(self, thumb_url: str) -> str:
         path = urlparse(thumb_url or "").path
         match = re.search(r'/thumb/(\d+)\.[A-Za-z0-9]+$', path)
+        if match:
+            return match.group(1)
+        match = re.search(r'/images/(\d+)\.[A-Za-z0-9]+$', path)
         return match.group(1) if match else ""
 
     def _thumb_url_for_source(self, thumb_url: str, source_id: str) -> str:
@@ -455,11 +731,13 @@ class PinseSpider:
         self.log("=" * 60)
         self.log(f"{CRAWLER_NAME} 视频爬虫启动 (site={self.site})")
         self.log("=" * 60)
+        self.log(f"配置: 列表路径 {self.base_url}")
         self.log(f"配置: 列表页延时 {MIN_PAGE_DELAY}-{MAX_PAGE_DELAY}s, 详情页延时 {MIN_DETAIL_DELAY}-{MAX_DETAIL_DELAY}s")
         self.log(f"配置: 最大重试 {MAX_RETRIES} 次, 连续空页上限 {self.max_empty_pages}")
         self.log(f"配置: 起始页 {self.start_page}, 最大爬取页数 {self.max_pages if self.max_pages else '不限'}")
-        if self.target_new:
-            self.log(f"配置: 目标新增视频数 {self.target_new}")
+        budget = self._output_budget()
+        if budget:
+            self.log(f"配置: 候选输出上限 {budget}")
         self.log(f"配置: 输出文件 {os.path.abspath(self.output_file)}")
         if self.skip_viewkeys:
             self.log(f"配置: 已跳过 {len(self.skip_viewkeys)} 个已知 viewkey")
@@ -476,8 +754,8 @@ class PinseSpider:
             if consecutive_empty >= self.max_empty_pages:
                 self.log(f"连续 {self.max_empty_pages} 页无结果，已达到末尾")
                 break
-            if self.target_new is not None and self.processed_videos >= self.target_new:
-                self.log(f"已累计 {self.processed_videos} 个新视频，达到目标 {self.target_new}，停止")
+            if self._reached_output_budget():
+                self.log(f"已输出 {self.emitted if self.stream_output else self.processed_videos} 个候选，达到上限，停止")
                 break
 
             page_url = self.build_list_url(page_num)
@@ -507,7 +785,7 @@ class PinseSpider:
 
             consecutive_empty = 0
 
-            new_videos = [v for v in page_videos if v['viewkey'] not in self.skip_viewkeys]
+            new_videos = [v for v in page_videos if not self._is_seen(v)]
             skipped_on_page = len(page_videos) - len(new_videos)
 
             if skipped_on_page > 0:
@@ -518,21 +796,31 @@ class PinseSpider:
             if new_videos:
                 self._process_video_list(new_videos, referer=page_url)
             self.pages_crawled += 1
+            if self.stream_output:
+                write_jsonl({
+                    "type": "progress",
+                    "checked": self.checked,
+                    "emitted": self.emitted,
+                    "message": f"Scanning page {page_num}",
+                })
             page_num += 1
             crawled_in_session += 1
 
-        self._save_results()
-        self._print_summary()
+        if not self.job_mode:
+            self._save_results()
+            self._print_summary()
 
     def _process_video_list(self, videos: list, referer: str = ""):
         for idx, video in enumerate(videos, 1):
-            if self.target_new is not None and self.processed_videos >= self.target_new:
+            if self._reached_output_budget():
                 return
-            if video['viewkey'] in self.skip_viewkeys:
-                self.log(f"  [SKIP] 已处理过: {video['viewkey']}")
+            if self._is_seen(video):
+                self.log(f"  [SKIP] 已处理过: {video.get('source_id') or video['viewkey']}")
                 self.skipped_videos += 1
+                self.checked += 1
                 continue
 
+            self.checked += 1
             self.log(f"  处理视频 {idx}/{len(videos)}: {video['title'][:40]}...")
 
             if idx > 1:
@@ -548,10 +836,15 @@ class PinseSpider:
                 self.failed_videos += 1
                 continue
 
-            detail_info = self.parse_detail_page(detail_html)
+            detail_info = self.parse_detail_page(
+                detail_html,
+                referer=video["detail_url"],
+            )
 
             if detail_info.get("video_url"):
                 video["video_url"] = detail_info["video_url"]
+                if detail_info.get("quality"):
+                    video["quality"] = detail_info["quality"]
                 if detail_info.get("title"):
                     video["title"] = detail_info["title"]
                 list_source_id = video.get("source_id", "")
@@ -581,7 +874,10 @@ class PinseSpider:
                     self.skip_viewkeys.add(video["source_id"])
                 self.processed_videos += 1
                 self.log(f"  [OK] 成功提取视频直链")
-                self.emit_stream_video(video)
+                if self.emit_stream_video(video):
+                    self.emitted += 1
+                if self._reached_output_budget():
+                    return
             else:
                 self.log(f"  [FAIL] 未找到视频直链: {video['viewkey']}")
                 video["video_url"] = ""
@@ -614,9 +910,10 @@ class PinseSpider:
             self.log(f"结果已保存到: {os.path.abspath(out_path)}")
         except Exception as e:
             self.log(f"保存文件失败: {e}")
-            backup_out = sys.stderr if self.stream_output else sys.stdout
-            print("\n--- 备份输出 ---", file=backup_out, flush=True)
-            print(json.dumps(output_data, ensure_ascii=False, indent=2), file=backup_out, flush=True)
+            if not self.job_mode:
+                backup_out = sys.stderr if self.stream_output else sys.stdout
+                print("\n--- 备份输出 ---", file=backup_out, flush=True)
+                print(json.dumps(output_data, ensure_ascii=False, indent=2), file=backup_out, flush=True)
 
     def _print_summary(self):
         self.log("")
@@ -638,29 +935,44 @@ def print_help():
     91pinse 视频爬虫
 ================================================
 
-本脚本将爬取 91pinse 列表下的所有视频信息：
+本脚本默认爬取 91pinse 热门列表 /v/hot/ 下的视频信息：
   - 视频名称
   - 封面图直链
-  - 视频直链 (MP4)
+  - 视频直链 (m3u8 / mp4)
 
 依赖安装:
     pip install requests beautifulsoup4 lxml PySocks
 
 使用方法:
+    python3 91Pinse.py --job /path/to/job.json
     python 91Pinse.py --site https://91pinse.com
 
-注意: 不同镜像站 HTML 可能不同，如解析失败请调整 parse_list_page / parse_detail_page
+注意: 旧版镜像站 HTML 可能不同，如解析失败请调整 parse_list_page / parse_detail_page
 """)
 
 
 def run_job(job_path: str):
-    with open(job_path, "r", encoding="utf-8") as f:
-        job = json.load(f)
+    try:
+        with open(job_path, "r", encoding="utf-8") as f:
+            job = json.load(f)
+    except Exception as e:
+        print(f"错误: 无法读取 job 文件: {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
 
     if job.get("protocol") != CRAWLER_PROTOCOL:
-        raise ValueError(f"unsupported crawler protocol: {job.get('protocol')!r}")
+        print(
+            f"错误: 不支持的协议: {job.get('protocol')!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
     if job.get("mode") not in ("", None, "crawl"):
-        raise ValueError(f"unsupported crawler mode: {job.get('mode')!r}")
+        print(
+            f"错误: 不支持的 mode: {job.get('mode')!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
 
     candidate_budget = positive_int(
         job.get("candidate_budget"),
@@ -678,14 +990,15 @@ def run_job(job_path: str):
     site = str(config.get("site") or DEFAULT_SITE).strip() or DEFAULT_SITE
 
     seen_file = job.get("seen_source_ids_file") or ""
-    output_dir = job.get("output_dir") or os.getcwd()
-    run_id = job.get("run_id") or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, f"spider91pinse-{run_id}.json")
+    output_dir = job.get("output_dir") or ""
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     network = job.get("network") if isinstance(job.get("network"), dict) else {}
     proxy_url = str(network.get("proxy_url") or "").strip()
+    proxies = None
     if proxy_url:
+        proxies = {"http": proxy_url, "https": proxy_url}
         os.environ["HTTP_PROXY"] = proxy_url
         os.environ["HTTPS_PROXY"] = proxy_url
         os.environ["http_proxy"] = proxy_url
@@ -693,14 +1006,14 @@ def run_job(job_path: str):
         os.environ["NO_PROXY"] = ""
         os.environ["no_proxy"] = ""
 
-    seen_viewkeys = []
+    seen_source_ids = []
     if seen_file:
         try:
             with open(seen_file, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line:
-                        seen_viewkeys.append(line)
+                        seen_source_ids.append(line)
         except FileNotFoundError:
             print(f"警告: seen_source_ids_file 不存在: {seen_file}", file=sys.stderr, flush=True)
         except Exception as e:
@@ -709,31 +1022,33 @@ def run_job(job_path: str):
     prefer_ipv4_for_plain_socks5_proxy()
     spider = PinseSpider(
         site=site,
-        output_file=output_file,
         start_page=1,
         max_pages=None,
         resume=False,
         quiet=True,
-        target_new=candidate_budget,
-        seen_viewkeys=seen_viewkeys,
+        candidate_budget=candidate_budget,
+        seen_viewkeys=seen_source_ids,
         stream_output=True,
         stream_protocol="crawler.v1",
+        proxies=proxies,
+        job_mode=True,
     )
     try:
         spider.crawl()
-        done = {
+        write_jsonl({
             "type": "done",
             "stats": {
-                "emitted": spider.processed_videos,
-                "failed": spider.failed_videos,
-                "skipped": spider.skipped_videos,
+                "checked": spider.checked,
+                "emitted": spider.emitted,
             },
-        }
-        write_jsonl(done)
-    except KeyboardInterrupt:
-        spider.log("\n用户中断，正在保存已爬取的数据...")
-        spider._save_results()
-        raise
+        })
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.exit(0)
+    except Exception as e:
+        print(f"错误: 爬虫执行失败: {e}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
 
 def main():
@@ -778,9 +1093,9 @@ def main():
                     if line:
                         seen_viewkeys.append(line)
         except FileNotFoundError:
-            print(f"警告: --seen-viewkeys-file 不存在: {args.seen_viewkeys_file}")
+            print(f"警告: --seen-viewkeys-file 不存在: {args.seen_viewkeys_file}", file=sys.stderr)
         except Exception as e:
-            print(f"警告: 读取 --seen-viewkeys-file 失败: {e}")
+            print(f"警告: 读取 --seen-viewkeys-file 失败: {e}", file=sys.stderr)
 
     if args.page is not None:
         start_page = max(1, args.page)
@@ -821,4 +1136,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        sys.exit(0)
