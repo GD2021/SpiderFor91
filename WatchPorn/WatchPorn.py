@@ -56,10 +56,11 @@ def parse_list_page(html):
     if not items:
         for a in soup.select('a[href*="/video/"]'):
             href = a.get("href", "")
-            m = re.search(r"/video/(\d+)", href)
+            m = re.search(r"/video/(\d+)(?:/([a-zA-Z0-9_-]+))?/?", href)
             if not m or m.group(1) in seen_ids:
                 continue
             vid = m.group(1)
+            slug = m.group(2) or ""
             seen_ids.add(vid)
             img = a.select_one("img")
             pic = format_pic(img.get("data-original", "") or img.get("src", "")) if img else ""
@@ -70,7 +71,7 @@ def parse_list_page(html):
                 or (img.get("alt", "") if img else "")
                 or a.get_text()
             )
-            items.append({"id": vid, "title": title, "pic": pic, "duration": duration})
+            items.append({"id": vid, "slug": slug, "title": title, "pic": pic, "duration": duration})
 
     return items
 
@@ -82,10 +83,11 @@ def _parse_thumb_item(el):
     if not link:
         return None
     href = link.get("href", "")
-    m = re.search(r"/video/(\d+)", href)
+    m = re.search(r"/video/(\d+)(?:/([a-zA-Z0-9_-]+))?/?", href)
     if not m:
         return None
     vid = m.group(1)
+    slug = m.group(2) or ""
 
     title_el = el.select_one(".thumb__title")
     title = clean_text(title_el.get_text()) if title_el else ""
@@ -108,7 +110,7 @@ def _parse_thumb_item(el):
         dur_el = el.select_one(".thumb__meta-item")
     duration = clean_text(dur_el.get_text()) if dur_el else ""
 
-    return {"id": vid, "title": title, "pic": pic, "duration": duration}
+    return {"id": vid, "slug": slug, "title": title, "pic": pic, "duration": duration}
 
 
 def extract_page_count(html):
@@ -332,7 +334,7 @@ def main():
                         "title": meta.get("title") or item["title"],
                         "media_url": media_url,
                         "thumbnail_url": meta.get("thumbnail_url") or item["pic"],
-                        "detail_url": f"{HOST}/video/{source_id}",
+                        "detail_url": f"{HOST}/video/{source_id}/{item['slug']}/" if item.get("slug") else f"{HOST}/video/{source_id}",
                         "headers": {
                             "Referer": f"{HOST}/",
                             "User-Agent": UA,
